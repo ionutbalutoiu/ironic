@@ -28,6 +28,7 @@ from ironic.drivers.modules import ipminative
 from ironic.drivers.modules import ipmitool
 from ironic.drivers.modules import pxe
 from ironic.drivers.modules import ssh
+from ironic.drivers.modules import hyperv
 from ironic.drivers.modules.ucs import management as ucs_mgmt
 from ironic.drivers.modules.ucs import power as ucs_power
 from ironic.drivers.modules import virtualbox
@@ -122,6 +123,28 @@ class AgentAndSSHDriver(base.BaseDriver):
         self.inspect = inspector.Inspector.create_if_enabled(
             'AgentAndSSHDriver')
         self.console = ssh.ShellinaboxConsole()
+
+
+class AgentAndHyperVDriver(base.BaseDriver):
+    """Agent + Hyper-V driver.
+    NOTE: This driver is meant only for testing environments.
+    This driver implements the `core` functionality, combining
+    :class:`ironic.drivers.modules.hyperv.HypervPower` (for power on/off and
+    reboot of virtual machines over WinRM calls), with
+    :class:`ironic.drivers.modules.agent.AgentDeploy` (for image
+    deployment). Implementations are in those respective classes; this class
+    is merely the glue between them.
+    """
+
+    def __init__(self):
+        self.power = hyperv.HyperVPower()
+        self.boot = pxe.PXEBoot()
+        self.deploy = agent.AgentDeploy()
+        self.management = hyperv.HyperVManagement()
+        self.vendor = agent.AgentVendorInterface()
+        self.raid = agent.AgentRAID()
+        self.inspect = inspector.Inspector.create_if_enabled(
+            'AgentAndHyperVDriver')
 
 
 class AgentAndVirtualBoxDriver(base.BaseDriver):
