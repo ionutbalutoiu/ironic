@@ -22,12 +22,6 @@ REQUIRED_PROPERTIES = {
     'power_pass': _("Power password"),
 }
 
-_BOOT_DEVICES_MAP = {
-    boot_devices.DISK: 'HardDiskDrive',
-    boot_devices.PXE: 'VMNetworkAdapter',
-    boot_devices.CDROM: 'DvdDrive',
-}
-
 # WinRM constants
 AUTH_BASIC = "basic"
 AUTH_KERBEROS = "kerberos"
@@ -36,7 +30,29 @@ DEFAULT_PORT_HTTP = 5985
 DEFAULT_PORT_HTTPS = 5986
 
 
-def get_url(url=None, host=None, use_ssl=None, port=None):
+def _get_vm_generation(driver_info):
+    cmd_args = ["(Get-VM -VMName '%s').Generation" % driver_info['node_name']]
+    std_out = _run_remote_ps_cmd(driver_info, cmd_args)
+    return int(std_out.strip())
+
+
+def _get_boot_devices_map(vm_generation):
+    if vm_generation == 1:
+        return {
+            boot_devices.DISK: 'IDE',
+            boot_devices.PXE: 'LegacyNetworkAdapter',
+            boot_devices.CDROM: 'CD',
+        }
+    elif vm_generation == 2:
+        return {
+            boot_devices.DISK: 'HardDiskDrive',
+            boot_devices.PXE: 'VMNetworkAdapter',
+            boot_devices.CDROM: 'DvdDrive',
+        }
+    raise Exception("Unknown VM Generation.")
+
+
+def _get_wsman_url(url=None, host=None, use_ssl=None, port=None):
     if url:
         return url
     else:
@@ -54,7 +70,7 @@ def get_url(url=None, host=None, use_ssl=None, port=None):
         return ("%(protocol)s://%(host)s:%(port)s/wsman" % locals())
 
 
-def run_wsman_cmd(url=None, auth=None, username=None, password=None,
+def _run_wsman_cmd(url=None, auth=None, username=None, password=None,
                   cert_pem=None, cert_key_pem=None, cmd=None):
     protocol.Protocol.DEFAULT_TIMEOUT = "PT3600S"
 
@@ -89,8 +105,8 @@ def _run_remote_ps_cmd(driver_info, cmd_args, b64encoded=False):
     else:
         ps_exec = ["powershell.exe", "-Command"]
 
-    std_out, std_err, exit_code = run_wsman_cmd(
-            url=get_url(host=driver_info['address'], use_ssl=True),
+    std_out, std_err, exit_code = _run_wsman_cmd(
+            url=_get_wsman_url(host=driver_info['address'], use_ssl=True),
             auth="basic",
             username=driver_info['username'],
             password=driver_info['password'],
@@ -228,7 +244,11 @@ class HyperVManagement(base.ManagementInterface):
                   in :mod:`ironic.common.boot_devices`.
 
         """
-        return list(_BOOT_DEVICES_MAP.keys())
+        return [
+            boot_devices.DISK,
+            boot_devices.PXE,
+            boot_devices.CDROM
+        ]
 
     def set_boot_device(self, task, device, persistent=False):
         """Set the boot device for the task's node.
@@ -237,52 +257,116 @@ class HyperVManagement(base.ManagementInterface):
 
         """
         driver_info = _parse_driver_info(task.node)
+        vm_generation = _get_vm_generation(driver_info)
+        boot_devices_map = _get_boot_devices_map(vm_generation)
         ps_script = """
         $ErrorActionPreference = "Stop";
         $vmName = '%s';
-        $deviceType = '%s';
+        $deviceName = '%s';
 
-        $bootOrder = (Get-VMFirmware $vmName).BootOrder;
-        $validBootTypes = @('Drive', 'Network');
-        $validBootDevices = @();
-        foreach ($bootDevice in $bootOrder) {
-            if (($bootDevice.BootType -in $validBootTypes) -and
-                ($bootDevice.Device.GetType().Name -eq $deviceType)) {
-                $validBootDevices += $bootDevice;
+        $gen = (Get-VM $vmName).Generation;
+        switch ($gen) {
+            1 {
+                $vmBios = Get-VMBios -VMName $vmName;
+                $bootOrder = $vmBios.StartupOrder;
+                if ($bootOrder[0] -eq $deviceName) {
+                    Write-Host ("'$deviceName' is already set as first " +
+                                "boot device.");
+                    exit 0;
+                }
+
+                $device = $null;
+                foreach ($bootDevice in $bootOrder) {
+                    if ($bootDevice -eq $deviceName) {
+                        $device = $bootDevice;
+                        break;
+                    }
+                }
+
+                $index = $bootOrder.IndexOf($device);
+                if ($index -eq -1) {
+                    Write-Host "'$deviceName' boot device can't be found.";
+                    exit 1;
+                }
+
+                $oldBootDevice = $bootOrder[0];
+                $bootOrder[0] = $device;
+                $bootOrder[$index] = $oldBootDevice;
+
+                if ((Get-VM -VMName $vmName).State -eq 'Running') {
+                    Stop-VM -VMName $vmName -TurnOff;
+                    Set-VMBios -VMName $vmName -StartupOrder $bootOrder;
+                    Start-VM -VMName $vmName;
+                } else {
+                    Set-VMBios -VMName $vmName -StartupOrder $bootOrder;
+                }
+            }
+
+            2 {
+                $bootOrder = (Get-VMFirmware $vmName).BootOrder;
+                $validBootTypes = @('Drive', 'Network');
+                $validBootDevices = @();
+                foreach ($bootDevice in $bootOrder) {
+                    if (($bootDevice.BootType -in $validBootTypes) -and
+                        ($bootDevice.Device.GetType().Name -eq $deviceName)) {
+                        $validBootDevices += $bootDevice;
+                    }
+                }
+
+                if ($validBootDevices.Length -eq 0) {
+                    Write-Host "No '$deviceName' boot device found.";
+                    exit 1;
+                }
+
+                $device = $validBootDevices[0];
+                $index = $bootOrder.IndexOf($device);
+                if ($index -eq 0) {
+                    Write-Host ("'$deviceName' is already set as first " +
+                                "boot device.");
+                    exit 0;
+                }
+
+                $oldBootDevice = $bootOrder[0];
+                $bootOrder[0] = $device;
+                $bootOrder[$index] = $oldBootDevice;
+
+                Set-VMFirmware -VMName $vmName -BootOrder $bootOrder;
+            }
+
+            default {
+                Write-Host "Cannot set '$deviceName' as first boot device.";
+                exit 1
             }
         }
-
-        if ($validBootDevices.Length -eq 0) {
-            Write-Host "No '$deviceType' boot device found.";
-            exit 1;
-        }
-
-        $device = $validBootDevices[0];
-        $index = $bootOrder.IndexOf($device);
-        if ($index -eq 0) {
-            Write-Host "'$deviceType' is already set as first boot device.";
-            exit 0;
-        }
-
-        $oldBootDevice = $bootOrder[0];
-        $bootOrder[0] = $device;
-        $bootOrder[$index] = $oldBootDevice;
-
-        Set-VMFirmware -VMName $vmName -BootOrder $bootOrder;
-        Write-Host "'$deviceType' successfully set as first boot device."
-        """ % (driver_info['node_name'], _BOOT_DEVICES_MAP[device])
+        Write-Host "'$deviceName' successfully set as first boot device.";
+        """ % (driver_info['node_name'], boot_devices_map[device])
 
         encoded_script = b64encode(ps_script.encode("utf-16-le"))
         _run_remote_ps_cmd(driver_info, [encoded_script], b64encoded=True)
 
     def get_boot_device(self, task):
         driver_info = _parse_driver_info(task.node)
+        vm_generation = _get_vm_generation(driver_info)
+        boot_devices_map = _get_boot_devices_map(vm_generation)
         ps_script = """
         $ErrorActionPreference = "Stop";
-        $firstBootSource = (Get-VMFirmware '%s').BootOrder[0];
-        if ($firstBootSource.BootType -in @('Drive', 'Network')) {
-            Write-Host $firstBootSource.Device.GetType().Name;
-            exit 0
+        $vmName = '%s';
+        $gen = (Get-VM $vmName).Generation;
+        switch ($gen) {
+            1 {
+                Write-Host (Get-VMBios -VMName $vmName).StartupOrder[0];
+                exit 0
+            }
+            2 {
+                $firstBootSource = (Get-VMFirmware $vmName).BootOrder[0];
+                if ($firstBootSource.BootType -in @('Drive', 'Network')) {
+                    Write-Host $firstBootSource.Device.GetType().Name;
+                    exit 0
+                }
+            }
+            default {
+                exit 1
+            }
         }
         """ % (driver_info['node_name'])
 
@@ -293,7 +377,7 @@ class HyperVManagement(base.ManagementInterface):
         # Standard output from WinRM call comes with whitespaces at the end, we
         # just strip those.
         current_boot_device = std_out.strip()
-        for boot_device, boot_device_hyperv in _BOOT_DEVICES_MAP.iteritems():
+        for boot_device, boot_device_hyperv in boot_devices_map.iteritems():
             if current_boot_device == boot_device_hyperv:
                 return {'boot_device': boot_device, 'persistent': True}
 
